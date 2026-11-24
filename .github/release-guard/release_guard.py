@@ -9,7 +9,8 @@ rule or its trust file has under 30 days left, so GitHub emails the repo owner.
 Rules: update-trust.stable.txt present; signature verifies against a Kestrel update key (current or next, copied from
 win/Kestrel.Core/License/LicenseKeys.cs in the app repo; a test there keeps them equal); product, kind, channel stable; version equals
 the tag; sha256 equals the full nupkg (GitHub's digest) and releases.win.json; counter higher than every other published release;
-at least 60 days to expiry at publish time; Setup.exe, Portable and nupkg not empty.
+at least 60 days to expiry at publish time; Setup.exe, Portable and nupkg not empty; no delta package attached or listed in
+releases.win.json (B-196; only the published v1.0.0 keeps its one historic delta, see HISTORIC_DELTAS).
 
 Copied from tools/release/github-guard/release_guard.py in the Kestrel app repo. Edit it there, test it there, copy it here.
 """
@@ -31,6 +32,37 @@ AUDIT_MIN_DAYS = 30
 TAG = re.compile(r"^v([0-9]{1,4})\.([0-9]{1,4})\.([0-9]{1,4})$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")   # DER header of an Ed25519 public key
+
+# B-196: no delta package on a stable release (the app refuses a package Velopack rebuilt from a delta, because its bytes never hash to
+# the signed full package). The one exception is the v1.0.0 published before the rule, with these exact bytes; 1.0.0 is the base
+# release, so no update goes through its own delta. Never add a row. Equal to HISTORIC_DELTAS in tools/release/verify-release.py (tested).
+HISTORIC_DELTAS = {
+    "1.0.0": {"name": "Kestrel-1.0.0-delta.nupkg", "sha256": "c8938ce34472a70cea9f8de9994bc6361fd18b82612d1facea3c4d2890365c74", "size": 3661688},
+}
+
+
+def asset_sha(asset):
+    d = (asset or {}).get("digest") or ""
+    return d[7:].lower() if isinstance(d, str) and d.startswith("sha256:") and HEX64.match(d[7:].lower()) else None
+
+
+def delta_problems(version, assets, entries):
+    """Pure. The guard only ever sees published releases, so the historic exception is keyed on the version and exact bytes alone."""
+    allowed = HISTORIC_DELTAS.get(version)
+    out = []
+    files = [a for a in assets if "delta" in a["name"].lower()]
+    for a in files:
+        if allowed and len(files) == 1 and a["name"] == allowed["name"] and asset_sha(a) == allowed["sha256"] and a.get("size") == allowed["size"]:
+            continue
+        out.append("a delta package (%s) is attached; a stable release carries its full package only (B-196)" % a["name"])
+    listed = [e for e in entries if not isinstance(e, dict) or e.get("Type") != "Full" or "delta" in str(e.get("FileName", "")).lower()]
+    for e in listed:
+        if (allowed and len(listed) == 1 and e.get("Type") == "Delta" and e.get("Version") == version and e.get("FileName") == allowed["name"]
+                and isinstance(e.get("SHA256"), str) and e["SHA256"].lower() == allowed["sha256"] and e.get("Size") == allowed["size"]):
+            continue
+        out.append("releases.win.json lists a delta package (%s); a stable feed lists full packages only (B-196)"
+                   % (e.get("FileName") if isinstance(e, dict) else None))
+    return out
 
 
 def applies(tag):
@@ -107,18 +139,22 @@ def evaluate(rel, files, now, keys, others=(), min_days=PUBLISH_MIN_DAYS):
             bad.append("%s is missing" % name)
         elif not isinstance(a.get("size"), int) or a["size"] <= 0:
             bad.append("%s is empty" % name)
-    d = (by.get(pkg_name) or {}).get("digest") or ""
-    pkg_sha = d[7:].lower() if d.startswith("sha256:") and HEX64.match(d[7:].lower()) else None
+    pkg_sha = asset_sha(by.get(pkg_name))
     if pkg_name in by and pkg_sha is None:
         bad.append("GitHub gives no sha256 digest for %s" % pkg_name)
+    entries = []
     if MANIFEST in by:
         try:
             entries = json.loads(files[MANIFEST].decode("utf-8-sig"))["Assets"]
+            if not isinstance(entries, list):
+                raise TypeError("no Assets list")
             full = [e for e in entries if e.get("Version") == version and e.get("Type") == "Full"]
             if len(full) != 1 or str(full[0].get("SHA256", "")).lower() != pkg_sha or full[0].get("FileName") != pkg_name:
                 bad.append("releases.win.json does not list %s with the uploaded package hash" % pkg_name)
         except (KeyError, TypeError, ValueError, AttributeError, UnicodeDecodeError):
             bad.append("releases.win.json could not be read")
+            entries = []
+    bad.extend(delta_problems(version, assets, entries))
     if TRUST in by:
         doc, why = read_trust(files.get(TRUST), keys)
         if why:
